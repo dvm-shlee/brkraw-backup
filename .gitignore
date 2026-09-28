@@ -5,3 +5,4 @@ CLAUDE.md
 # Build output (for example from pip install .)
 build/
 *.egg-info/
+__pycache__/
