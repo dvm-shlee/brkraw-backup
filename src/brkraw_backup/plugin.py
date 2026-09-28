@@ -797,7 +797,7 @@ main commands:
 
 advanced: migrate (import a 0.3.x cache), about (versions and paths)
 
-brkraw-backup never deletes raw folders. Removed in 0.2.0: info, registry, scan, review, run.
+brkraw-backup never deletes raw folders.
 """
 
 
@@ -871,8 +871,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[na
     about_p.add_argument("--root", help=_ROOT_HELP)
     about_p.set_defaults(func=cmd_about, parser=about_p)
 
+    # No `help=` here on purpose: argparse lists a sub-command in --help whenever `help` is
+    # given at all (even SUPPRESS, which prints "name ==SUPPRESS=="). Without it the parser
+    # still answers to the old name but is not listed.
     for name in REMOVED_COMMANDS:
-        old = sub.add_parser(name, help=argparse.SUPPRESS, add_help=False, prefix_chars="\x00")
+        old = sub.add_parser(name, add_help=False, prefix_chars="\x00")
         old.add_argument("ignored", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
         old.set_defaults(func=_removed(name), parser=old)
 

@@ -731,3 +731,20 @@ def test_help_lists_the_new_commands(capsys):
     for name in ("status", "create", "verify", "repair", "remove", "purge", "init", "migrate", "about"):
         assert name in out
     assert "never deletes raw" in out
+
+
+def test_help_does_not_show_removed_names_or_suppress(capsys):
+    import re
+    with pytest.raises(SystemExit):
+        main(["backup", "--help"])
+    out = capsys.readouterr().out
+    assert "SUPPRESS" not in out
+    for old in plugin.REMOVED_COMMANDS:
+        # not listed as a command (the word "registry" is fine inside a sentence)
+        assert not re.search(r"^\s+%s(\s|$)" % old, out, re.M), old
+        assert not re.search(r"[{,]%s[},]" % old, out), old
+    assert "Removed in" not in out
+    usage = out.split("\n\n", 1)[0]
+    assert "{" not in usage
+    # the old names still answer (T6 covers the message and exit code)
+    assert main(["backup", "run"]) == 2
