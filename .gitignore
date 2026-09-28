@@ -1,0 +1,7 @@
+# Local AI agent guidance (not version controlled)
+AGENTS.md
+CLAUDE.md
+
+# Build output (for example from pip install .)
+build/
+*.egg-info/
