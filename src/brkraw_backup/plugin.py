@@ -1,38 +1,46 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import sys
 import time
 import shutil
 from pathlib import Path
-from typing import Optional, TextIO, Any, cast
+from typing import Callable, Dict, List, Optional, TextIO, Any, Tuple, cast
 
 from brkraw.core import config as config_core
 
-from . import __version__
+from . import __version__, actions, layout
 from .core import (
     DEFAULT_REGISTRY_NAME,
-    archive_one,
-    deep_integrity_check,
     load_registry,
     load_legacy_cache,
-    mark_backup_result,
     migrate_legacy_cache_to_registry,
-    maybe_delete_raw,
     render_scan_table,
     save_registry,
     scan_datasets,
+    set_entry_fields,
     snapshots_from_registry,
     update_registry,
-    verify_archive,
+    verify_label,
 )
+from .verify import LEVELS, verify_archive
 
 logger = logging.getLogger("brkraw")
 
 _BANNER_PRINTED = False
 _STDOUT: TextIO = cast(TextIO, sys.__stdout__)
 _STDERR: TextIO = cast(TextIO, sys.__stderr__)
+
+# Commands removed in 0.2.0 (BRK-0052): no alias, one line, exit 2.
+REMOVED_COMMANDS: Dict[str, str] = {
+    "info": "`info` was removed in brkraw-backup 0.2.0; use `brkraw backup status`.",
+    "registry": "`registry` was removed in brkraw-backup 0.2.0; use `brkraw backup status`.",
+    "scan": "`scan` was removed in brkraw-backup 0.2.0; use `brkraw backup status --scan`.",
+    "review": "`review` was removed in brkraw-backup 0.2.0; use `brkraw backup status --scan --issues`.",
+    "run": "`run` was removed in brkraw-backup 0.2.0; use `brkraw backup create` (to rebuild an archive: `brkraw backup repair KEY`).",
+}
 
 
 def _banner() -> None:
@@ -68,10 +76,6 @@ def _make_progress(args: argparse.Namespace):
     start = time.time()
 
     def _label(step: str) -> str:
-        if step.startswith("scan:"):
-            return "scan"
-        if step.startswith("zip:"):
-            return "zip"
         return step.split(":", 1)[0] if ":" in step else step
 
     def reporter(current: int, total: int, step: str) -> None:
@@ -170,12 +174,12 @@ def _resolve_paths(args: argparse.Namespace, *, need_raw: bool = True, need_arch
 
     missing: list[str] = []
     if need_raw and not raw_value:
-        missing.append("backup.rawdata (raw_root)")
+        missing.append("backup.rawdata (--rawdata)")
     if need_archive and not arc_value:
-        missing.append("backup.archive (archive_root)")
+        missing.append("backup.archive (--archive)")
     if missing:
         hint = (
-            "Provide the missing path(s) as CLI args (or --rawdata/--archive), "
+            "Pass --rawdata/--archive, "
             "or set them via: brkraw backup init <raw_root> <archive_root>."
         )
         raise ValueError(f"Missing required path(s): {', '.join(missing)}. {hint}")
@@ -188,6 +192,25 @@ def _resolve_paths(args: argparse.Namespace, *, need_raw: bool = True, need_arch
     raw_path = _resolve(raw_value) if raw_value else Path()
     arc_path = _resolve(arc_value) if arc_value else Path()
     return raw_path, arc_path
+
+
+def _paths(args: argparse.Namespace, *, need_raw: bool) -> Tuple[Optional[Path], Path]:
+    """(raw_root or None, archive_root). Raw is resolved when configured even if not needed."""
+    raw, arc = _resolve_paths(args, need_raw=need_raw, need_archive=True)
+    raw_value = getattr(args, "rawdata", None) or _get_backup_paths_from_config(root=getattr(args, "root", None))[0]
+    raw_root = raw if raw_value else None
+    _check_write_places(args, raw_root, arc)
+    return raw_root, arc
+
+
+def _check_write_places(args: argparse.Namespace, raw_root: Optional[Path], archive_root: Path) -> None:
+    """Everything brkraw-backup writes lives in the archive folder; keep that apart from raw."""
+    bad = layout.check_file_name(getattr(args, "registry", DEFAULT_REGISTRY_NAME))
+    if bad:
+        raise ValueError("--registry %s" % bad)
+    bad = layout.roots_problem(raw_root, archive_root)
+    if bad:
+        raise ValueError(bad)
 
 
 def _maybe_prompt_save_backup_paths(
@@ -246,13 +269,15 @@ def _maybe_prompt_save_backup_paths(
     logger.info("Saved backup.rawdata/archive to config.yaml.")
 
 
+# --- argument helpers ----------------------------------------------------------
+
+_ROOT_HELP = "Override brkraw config root directory (default: BRKRAW_CONFIG_HOME or ~/.brkraw)."
+
+
 def _add_init_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("raw_root", help="Directory containing raw datasets (subdirs).")
     parser.add_argument("archive_root", help="Directory to store dataset zip archives.")
-    parser.add_argument(
-        "--root",
-        help="Override brkraw config root directory (default: BRKRAW_CONFIG_HOME or ~/.brkraw).",
-    )
+    parser.add_argument("--root", help=_ROOT_HELP)
     parser.add_argument(
         "--force",
         action="store_true",
@@ -260,7 +285,25 @@ def _add_init_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_common_args(parser: argparse.ArgumentParser) -> None:
+def _add_path_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--rawdata", dest="rawdata", help="Raw folder for this command (default: config backup.rawdata).")
+    parser.add_argument("--archive", dest="archive", help="Archive folder for this command (default: config backup.archive).")
+    parser.add_argument(
+        "--registry",
+        default=DEFAULT_REGISTRY_NAME,
+        help=f"Registry filename stored under the archive folder (default: {DEFAULT_REGISTRY_NAME}).",
+    )
+    parser.add_argument("--root", help=_ROOT_HELP)
+    parser.add_argument(
+        "--no-config-prompt",
+        action="store_true",
+        help="Disable interactive prompt to save missing backup paths into config.yaml.",
+    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bar rendering.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen; change nothing.")
+
+
+def _add_migrate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("raw_root", nargs="?", help="Directory containing raw datasets (subdirs).")
     parser.add_argument("archive_root", nargs="?", help="Directory to store dataset zip archives.")
     parser.add_argument("--rawdata", dest="rawdata", help="Override config backup.rawdata for this command.")
@@ -270,134 +313,45 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_REGISTRY_NAME,
         help=f"Registry filename stored under archive_root (default: {DEFAULT_REGISTRY_NAME}).",
     )
-    parser.add_argument(
-        "--root",
-        help="Override brkraw config root directory (default: BRKRAW_CONFIG_HOME or ~/.brkraw).",
-    )
+    parser.add_argument("--root", help=_ROOT_HELP)
     parser.add_argument(
         "--no-config-prompt",
         action="store_true",
         help="Disable interactive prompt to save missing backup paths into config.yaml.",
     )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable progress bar rendering.",
-    )
-    parser.add_argument(
-        "--integrity",
-        choices=["off", "new", "all"],
-        default="off",
-        help="Optional deep integrity check (file list compare) for raw+archive pairs.",
-    )
-    parser.add_argument(
-        "--integrity-limit",
-        type=int,
-        default=0,
-        help="Max datasets to deep-check per run (0 means no limit).",
-    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bar rendering.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated; write nothing.")
 
 
-def _maybe_run_integrity_checks(
-    *,
-    args: argparse.Namespace,
-    registry: dict,
-    snapshots: list,
-) -> None:
-    mode = getattr(args, "integrity", "off")
-    if mode == "off":
+def _recorder(registry: dict, registry_path: Path, *, dry_run: bool) -> Callable[[str, Dict[str, Any]], None]:
+    def record(key: str, fields: Dict[str, Any]) -> None:
+        if dry_run:
+            return
+        set_entry_fields(registry, key, fields)
+        save_registry(registry_path, registry)
+
+    return record
+
+
+def _report_problems(problems: List[str]) -> int:
+    for p in problems:
+        logger.error("%s", p)
+    logger.error("Nothing was changed.")
+    return 2
+
+
+def _log_verify(key: str, res) -> None:
+    if res.ok:
+        logger.info("%s: verify %s OK (%s files)", key, res.level, res.details.get("archive_files", "?"))
         return
-    limit = int(getattr(args, "integrity_limit", 0) or 0)
-    checked = 0
+    logger.error("%s: verify %s FAIL: %s", key, res.level, res.reason)
+    for reason in res.reasons:
+        names = res.details.get(reason)
+        if isinstance(names, list) and names:
+            logger.error("  %s: %s", reason, ", ".join(str(n) for n in names))
 
-    datasets = registry.get("datasets", {})
-    if not isinstance(datasets, dict):
-        datasets = {}
-        registry["datasets"] = datasets
 
-    reporter, done = _make_progress(args)
-    candidates = []
-    for snap in snapshots:
-        if not getattr(snap, "raw_present", False) or not getattr(snap, "archive_present", False):
-            continue
-        if getattr(snap, "status", None) not in {"OK", "MISMATCH"}:
-            continue
-        if not snap.raw_path or not snap.archive_path:
-            continue
-        candidates.append(snap)
-
-    def _parse_iso(value: object):
-        if not isinstance(value, str) or not value.strip():
-            return None
-        try:
-            import datetime as _dt
-
-            return _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    def _epoch_seconds(value: object) -> float:
-        dt = _parse_iso(value)
-        if dt is None:
-            return 0.0
-        if dt.tzinfo is None:
-            # Treat naive timestamps as UTC.
-            import datetime as _dt
-
-            dt = dt.replace(tzinfo=_dt.timezone.utc)
-        return dt.timestamp()
-
-    def _needs_check(entry: dict) -> bool:
-        last_backup_ts = _epoch_seconds(entry.get("last_backup"))
-        integ = entry.get("integrity")
-        last_check_ts = 0.0
-        if isinstance(integ, dict):
-            last_check_ts = _epoch_seconds(integ.get("checked_at"))
-        # If we don't know backup time, only run once (until first check is recorded),
-        # otherwise `--integrity new` would keep re-checking the same newest keys forever.
-        if last_backup_ts <= 0:
-            return last_check_ts <= 0
-        # Run again only if backup is newer than the last check.
-        return last_check_ts < last_backup_ts
-
-    if mode == "new":
-        filtered = []
-        for snap in candidates:
-            entry = datasets.get(snap.key, {})
-            if not isinstance(entry, dict):
-                entry = {}
-            if _needs_check(entry):
-                filtered.append(snap)
-        candidates = filtered
-
-    def _last_backup_ts(snap) -> float:
-        entry = datasets.get(snap.key, {})
-        if isinstance(entry, dict):
-            return _epoch_seconds(entry.get("last_backup"))
-        return 0.0
-
-    # Deterministic ordering: newest backups first, then key.
-    candidates.sort(key=lambda s: (_last_backup_ts(s), s.key), reverse=True)
-
-    total = len(candidates)
-    for idx, snap in enumerate(candidates, start=1):
-        reporter(idx, total, "integrity:pick")
-        if limit and checked >= limit:
-            break
-        entry = datasets.get(snap.key, {})
-        if not isinstance(entry, dict):
-            entry = {}
-
-        reporter(checked + 1, max(1, limit or total), "integrity:run")
-        result = deep_integrity_check(Path(snap.raw_path), Path(snap.archive_path))
-        entry["integrity"] = result
-        datasets[snap.key] = entry
-        checked += 1
-
-    done()
-    if checked:
-        logger.info("Integrity checks completed: %d", checked)
-
+# --- commands --------------------------------------------------------------------
 
 def cmd_init(args: argparse.Namespace) -> int:
     _banner()
@@ -428,159 +382,310 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
-    _banner()
-    try:
-        raw_root, archive_root = _resolve_paths(args)
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return 2
-    registry_path = archive_root / args.registry
-
-    _maybe_prompt_save_backup_paths(args, raw_root=raw_root, archive_root=archive_root)
-    logger.debug("backup scan: raw_root=%s archive_root=%s registry=%s", raw_root, archive_root, registry_path)
-    reporter, done = _make_progress(args)
-    snapshots = scan_datasets(raw_root, archive_root, reporter=reporter)
-    done()
-    registry = load_registry(registry_path)
-    width = _effective_print_width(root=args.root)
-    logger.info(
-        "%s",
-        render_scan_table(
-            snapshots,
-            max_width=width,
-            registry=registry,
-            show_issue_details=logger.isEnabledFor(logging.DEBUG),
-        ),
-    )
-    _maybe_run_integrity_checks(args=args, registry=registry, snapshots=snapshots)
-    registry = update_registry(registry, snapshots, raw_root=raw_root, archive_root=archive_root)
-    save_registry(registry_path, registry)
-    return 0
-
-
-def cmd_review(args: argparse.Namespace) -> int:
-    _banner()
-    try:
-        raw_root, archive_root = _resolve_paths(args)
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return 2
-    width = _effective_print_width(root=args.root)
-
-    _maybe_prompt_save_backup_paths(args, raw_root=raw_root, archive_root=archive_root)
-    logger.debug("backup review: raw_root=%s archive_root=%s", raw_root, archive_root)
-    reporter, done = _make_progress(args)
-    snapshots_all = scan_datasets(raw_root, archive_root, reporter=reporter)
-    done()
-    snapshots = [s for s in snapshots_all if s.status != "OK"]
-    if not snapshots:
-        logger.info("No issues found.")
-        return 0
-    registry = load_registry(archive_root / args.registry)
-    logger.info(
-        "%s",
-        render_scan_table(
-            snapshots,
-            max_width=width,
-            registry=registry,
-            show_issue_details=logger.isEnabledFor(logging.DEBUG),
-        ),
-    )
-    return 0
-
-
-def cmd_run(args: argparse.Namespace) -> int:
-    _banner()
-    try:
-        raw_root, archive_root = _resolve_paths(args)
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return 2
-    width = _effective_print_width(root=args.root)
-    registry_path = archive_root / args.registry
-
-    _maybe_prompt_save_backup_paths(args, raw_root=raw_root, archive_root=archive_root)
-    logger.debug(
-        "backup run: raw_root=%s archive_root=%s rebuild=%s dry_run=%s delete_raw=%s",
-        raw_root,
-        archive_root,
-        bool(args.rebuild),
-        bool(args.dry_run),
-        bool(args.delete_raw),
-    )
-    reporter, done = _make_progress(args)
-    snapshots = scan_datasets(raw_root, archive_root, reporter=reporter)
-    done()
-    registry = load_registry(registry_path)
-    registry = update_registry(registry, snapshots, raw_root=raw_root, archive_root=archive_root)
-
-    selected: Optional[set[str]] = None
-    if args.only:
-        selected = {name.strip() for name in args.only.split(",") if name.strip()}
-
-    todo = []
-    for snap in snapshots:
-        if selected is not None and snap.key not in selected:
-            continue
-        if snap.status in {"MISSING", "MISMATCH"}:
-            if not snap.raw_present or not snap.raw_path:
-                continue
-            todo.append(Path(snap.raw_path).expanduser().resolve(strict=False))
-
-    if not todo:
-        logger.info("Nothing to archive.")
-        save_registry(registry_path, registry)
-        return 0
-
-    reporter, done = _make_progress(args)
-    for idx, raw_path in enumerate(todo, start=1):
-        reporter(idx, len(todo), "archive:datasets")
-        dest, added, skipped = archive_one(
-            raw_path,
-            archive_root,
-            rebuild=args.rebuild,
-            dry_run=args.dry_run,
-            reporter=reporter,
-        )
-        ok = True
-        if not args.dry_run:
-            ok = verify_archive(dest)
-        mark_backup_result(
-            registry,
-            key=raw_path.name,
-            archive_path=dest,
-            added=added,
-            skipped=skipped,
-            verified=ok,
-            dry_run=bool(args.dry_run),
-        )
-        if ok:
-            logger.info("Archived %s -> %s (added=%d skipped=%d)", raw_path.name, dest.name, added, skipped)
-            maybe_delete_raw(raw_path, allow=args.delete_raw, confirmed=args.yes, dry_run=args.dry_run)
+def _expand_status_tokens(tokens: set) -> set:
+    expanded = set()
+    for token in tokens:
+        if token in {"TODO", "NEED_BACKUP"}:
+            expanded.add("MISSING")
+        elif token == "ARCHIVED":
+            expanded.update({"ARCHIVED", "RAW_REMOVED"})
         else:
-            logger.error("Archive verification failed: %s", dest)
-    done()
+            expanded.add(token)
+    return expanded
 
-    # Newly created/updated archives can be integrity-checked immediately.
-    if getattr(args, "integrity", "off") != "off":
-        snapshots = scan_datasets(raw_root, archive_root)
-        _maybe_run_integrity_checks(args=args, registry=registry, snapshots=snapshots)
 
-    reporter, done = _make_progress(args)
-    snapshots = scan_datasets(raw_root, archive_root, reporter=reporter)
-    done()
-    registry = update_registry(registry, snapshots, raw_root=raw_root, archive_root=archive_root)
-    save_registry(registry_path, registry)
+def cmd_status(args: argparse.Namespace) -> int:
+    _banner()
+    try:
+        raw_root, archive_root = _paths(args, need_raw=bool(args.scan))
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
+    registry_path = archive_root / args.registry
+    registry = load_registry(registry_path)
+
+    if args.scan:
+        assert raw_root is not None
+        _maybe_prompt_save_backup_paths(args, raw_root=raw_root, archive_root=archive_root)
+        reporter, done = _make_progress(args)
+        snapshots = scan_datasets(raw_root, archive_root, reporter=reporter)
+        done()
+        if not args.dry_run:
+            registry = update_registry(registry, snapshots, raw_root=raw_root, archive_root=archive_root)
+            save_registry(registry_path, registry)
+    else:
+        snapshots = snapshots_from_registry(registry)
+        # Unfinished repair/remove work is read live, so it shows even without --scan.
+        journals = layout.list_journals(archive_root)
+        by_key = {s.key: s for s in snapshots}
+        for key, j in journals.items():
+            tag = "unfinished:%s:%s" % (j.get("op"), j.get("step"))
+            snap = by_key.get(key)
+            if snap is None:
+                snap = snapshots_from_registry({"datasets": {key: {"key": key}}})[0]
+            issues = tuple(i for i in snap.issues if not i.startswith("unfinished:")) + (tag,)
+            by_key[key] = dataclasses.replace(snap, issues=issues, status="UNFINISHED")
+        snapshots = [by_key[k] for k in sorted(by_key)]
+        if not snapshots:
+            logger.info("Registry is empty: %s (run `brkraw backup status --scan`).", registry_path)
+            return 0
+
+    datasets = registry.get("datasets", {}) if isinstance(registry.get("datasets"), dict) else {}
+    if args.keys:
+        wanted = set(args.keys)
+        unknown = sorted(wanted - {s.key for s in snapshots})
+        for k in unknown:
+            logger.warning("%s: not found", k)
+        snapshots = [s for s in snapshots if s.key in wanted]
+    if args.issues:
+        snapshots = [
+            s for s in snapshots
+            if s.status not in {"OK", "ARCHIVED"} or verify_label(datasets.get(s.key)).endswith(":FAIL")
+        ]
+        if not snapshots:
+            logger.info("No issues found.")
+            return 0
+    if args.status:
+        include = _expand_status_tokens({t.strip().upper() for t in args.status.split(",") if t.strip()})
+        snapshots = [s for s in snapshots if s.status.upper() in include]
+
+    width = _effective_print_width(root=args.root)
     logger.info(
         "%s",
         render_scan_table(
             snapshots,
             max_width=width,
             registry=registry,
-            show_issue_details=logger.isEnabledFor(logging.DEBUG),
+            show_issue_details=bool(args.issues) or logger.isEnabledFor(logging.DEBUG),
         ),
     )
+    return 0
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    _banner()
+    try:
+        raw_root, archive_root = _paths(args, need_raw=True)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
+    assert raw_root is not None
+    _maybe_prompt_save_backup_paths(args, raw_root=raw_root, archive_root=archive_root)
+    if args.keys:
+        try:
+            targets = actions.resolve_targets("create", args.keys, raw_root=raw_root, archive_root=archive_root)
+        except actions.TargetError as exc:
+            return _report_problems(exc.problems)
+    else:
+        targets = actions.plan_create_all(raw_root, archive_root)
+    if not targets:
+        logger.info("Nothing to create: every raw folder already has an archive.")
+        return 0
+
+    registry_path = archive_root / args.registry
+    registry = load_registry(registry_path)
+    record = _recorder(registry, registry_path, dry_run=args.dry_run)
+    failed = 0
+    reporter, done = _make_progress(args)
+    for t in targets:
+        res = actions.create_one(t, archive_root, record, dry_run=args.dry_run, reporter=reporter)
+        if res.ok:
+            logger.info("%s: %s", t.key, res.message)
+        else:
+            failed += 1
+            logger.error("%s: %s", t.key, res.message)
+            if res.verify is not None:
+                _log_verify(t.key, res.verify)
+    done()
+    return 1 if failed else 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    _banner()
+    needs_raw = args.level in ("list", "content")
+    try:
+        raw_root, archive_root = _paths(args, need_raw=needs_raw)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
+    if not args.keys and not args.all:
+        logger.error("Name at least one KEY, or pass --all.")
+        return 2
+    if args.keys and args.all:
+        logger.error("Pass KEY names or --all, not both.")
+        return 2
+    if args.path is not None and len(args.keys) != 1:
+        logger.error("--path needs exactly one KEY.")
+        return 2
+
+    arcs = layout.archive_candidates(archive_root)
+    raws = layout.raw_candidates(raw_root) if raw_root is not None else {}
+    jobs: List[Tuple[str, Path, Optional[Path]]] = []
+    problems: List[str] = []
+    skipped: List[str] = []
+    if args.all:
+        for key, paths in arcs.items():
+            raw = raws.get(key)
+            if needs_raw and raw is None:
+                skipped.append(key)
+                continue
+            for p in paths:
+                jobs.append((key if len(paths) == 1 else "%s (%s)" % (key, p.name), p, raw))
+    else:
+        for key in dict.fromkeys(args.keys):
+            bad = layout.check_key(key)
+            if bad:
+                problems.append("%s: %s" % (key, bad))
+                continue
+            paths = list(arcs.get(key, []))
+            if args.path is not None:
+                chosen = Path(args.path).expanduser()
+                if not chosen.is_absolute():
+                    chosen = archive_root / chosen
+                paths = [p for p in paths if p.resolve(strict=False) == chosen.resolve(strict=False)]
+                if not paths:
+                    problems.append("%s: --path is not an archive of this key: %s" % (key, args.path))
+                    continue
+            if not paths:
+                problems.append("%s: no archive with this name" % key)
+                continue
+            if len(paths) > 1:
+                problems.append("%s: duplicate_archive (%s); pass --path to choose one" % (key, ", ".join(p.name for p in paths)))
+                continue
+            raw = raws.get(key)
+            if needs_raw and raw is None:
+                problems.append("%s: raw folder missing; level %s needs raw (use --level crc)" % (key, args.level))
+                continue
+            jobs.append((key, paths[0], raw))
+    if problems:
+        for p in problems:
+            logger.error("%s", p)
+        return 2
+    for key in skipped:
+        logger.warning("%s: skipped, raw folder missing (level %s needs raw)", key, args.level)
+    if not jobs:
+        logger.info("No archives to verify.")
+        return 0
+
+    registry_path = archive_root / args.registry
+    registry = load_registry(registry_path)
+    failed = 0
+    for label, path, raw in jobs:
+        res = verify_archive(path, raw, level=args.level)
+        _log_verify(label, res)
+        if not res.ok:
+            failed += 1
+        if not args.dry_run and label in arcs:
+            set_entry_fields(registry, label, {"verify": res.as_record(path)})
+    if not args.dry_run and jobs:
+        save_registry(registry_path, registry)
+    return 1 if failed else 0
+
+
+def _run_changes(args: argparse.Namespace, op: str) -> int:
+    _banner()
+    try:
+        raw_root, archive_root = _paths(args, need_raw=(op == "repair"))
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
+    try:
+        targets = actions.resolve_targets(
+            op, args.keys, raw_root=raw_root, archive_root=archive_root, path=getattr(args, "path", None)
+        )
+    except actions.TargetError as exc:
+        return _report_problems(exc.problems)
+
+    registry_path = archive_root / args.registry
+    registry = load_registry(registry_path)
+    record = _recorder(registry, registry_path, dry_run=args.dry_run)
+    reporter, done = _make_progress(args)
+    for t in targets:
+        if op == "remove" and t.raw_path is None and not args.dry_run:
+            logger.warning("%s: raw folder is missing; the trash copy will be the only copy.", t.key)
+        try:
+            if op == "repair":
+                res = actions.repair_one(t, archive_root, record, dry_run=args.dry_run, reporter=reporter)
+            else:
+                res = actions.remove_one(t, archive_root, record, dry_run=args.dry_run)
+        except Exception as exc:  # the journal stays; the next run finishes the work
+            done()
+            logger.error("%s: %s stopped: %s", t.key, op, exc)
+            logger.error("The journal was kept. Run `brkraw backup %s %s` again to finish.", op, t.key)
+            rest = [x.key for x in targets[targets.index(t) + 1:]]
+            if rest:
+                logger.error("Not started: %s", ", ".join(rest))
+            return 1
+        if not res.ok:
+            done()
+            logger.error("%s: %s", t.key, res.message)
+            if res.verify is not None:
+                _log_verify(t.key, res.verify)
+            rest = [x.key for x in targets[targets.index(t) + 1:]]
+            if rest:
+                logger.error("Not started: %s", ", ".join(rest))
+            return 1
+        logger.info("%s: %s", t.key, res.message)
+    done()
+    return 0
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    return _run_changes(args, "repair")
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    return _run_changes(args, "remove")
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    _banner()
+    try:
+        _, archive_root = _paths(args, need_raw=False)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
+    try:
+        targets = actions.resolve_targets("purge", args.keys, raw_root=None, archive_root=archive_root)
+    except actions.TargetError as exc:
+        return _report_problems(exc.problems)
+
+    total = 0
+    for t in targets:
+        for gen in t.generations:
+            size = actions.tree_bytes(gen)
+            total += size
+            logger.info("%s: %s (%d bytes)", t.key, gen, size)
+    logger.info("Total: %d trash generation(s), %d bytes.", sum(len(t.generations) for t in targets), total)
+    if args.dry_run:
+        logger.info("Dry run: nothing deleted.")
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            logger.error("Permanent delete needs confirmation: pass --yes or run in a terminal. Nothing deleted.")
+            return 2
+        try:
+            answer = input("Type 'yes' to delete these permanently: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer != "yes":
+            logger.info("Cancelled; nothing deleted.")
+            return 2
+
+    registry_path = archive_root / args.registry
+    registry = load_registry(registry_path)
+    record = _recorder(registry, registry_path, dry_run=False)
+    for t in targets:
+        res = actions.purge_one(t, archive_root, record, dry_run=False)
+        for gen in res.deleted:
+            logger.info("%s: deleted %s", t.key, gen)
+        if not res.ok:
+            logger.error("%s: %s", t.key, res.message)
+            rest = [x.key for x in targets[targets.index(t) + 1:]]
+            if rest:
+                logger.error("Not started: %s", ", ".join(rest))
+            return 1
+        logger.info("%s: %s", t.key, res.message)
     return 0
 
 
@@ -588,6 +693,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     _banner()
     try:
         raw_root, archive_root = _resolve_paths(args, need_raw=not bool(args.no_scan), need_archive=True)
+        _check_write_places(args, None if args.no_scan else raw_root, archive_root)
     except ValueError as exc:
         logger.error("%s", exc)
         return 2
@@ -602,15 +708,6 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     if args.old_cache == ".brk-backup_cache":
         logger.info("Using default legacy cache path (relative to archive_root).")
     logger.info("Archive root: %s", archive_root)
-
-    logger.debug(
-        "backup migrate: legacy=%s registry=%s no_scan=%s overwrite=%s keep_logs=%s",
-        legacy_path,
-        registry_path,
-        bool(args.no_scan),
-        bool(args.overwrite),
-        int(args.keep_logs),
-    )
     logger.info("Command: brkraw backup migrate")
     logger.info("Migrating legacy cache -> registry")
     logger.info("Legacy cache: %s", legacy_path)
@@ -658,111 +755,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             ),
         )
 
+    if args.dry_run:
+        logger.info("Dry run: registry not written (%d entries would migrate).", migrated)
+        return 0
     save_registry(registry_path, registry)
     logger.info("Migrated %d dataset entries from %s", migrated, legacy_path.name)
-    return 0
-
-
-def cmd_registry(args: argparse.Namespace) -> int:
-    _banner()
-    try:
-        _, archive_root = _resolve_paths(args, need_raw=False, need_archive=True)
-    except ValueError as exc:
-        logger.error("%s", exc)
-        return 2
-    registry_path = archive_root / args.registry
-
-    registry = load_registry(registry_path)
-    snapshots = snapshots_from_registry(registry)
-    if not snapshots:
-        logger.info("Registry is empty: %s", registry_path)
-        return 0
-
-    def _integ_label(key: str) -> str:
-        datasets = registry.get("datasets", {})
-        if not isinstance(datasets, dict):
-            return "-"
-        entry = datasets.get(key)
-        if not isinstance(entry, dict):
-            return "-"
-        integ = entry.get("integrity")
-        if not isinstance(integ, dict):
-            return "-"
-        ok = integ.get("ok")
-        bytes_match = integ.get("bytes_match")
-        if ok is True:
-            return "WARN" if bytes_match is False else "OK"
-        if ok is False:
-            return "FAIL"
-        if ok is None:
-            return "SKIP"
-        return "?"
-
-    include_status = getattr(args, "status", None)
-    exclude_status = getattr(args, "exclude_status", None)
-    include_integ = getattr(args, "integ", None)
-    exclude_integ = getattr(args, "exclude_integ", None)
-    if include_status or exclude_status or include_integ or exclude_integ:
-        def _expand(tokens: set[str]) -> set[str]:
-            expanded: set[str] = set()
-            for token in tokens:
-                if token in {"TODO", "NEED_BACKUP"}:
-                    expanded.add("MISSING")
-                    continue
-                if token == "ARCHIVED":
-                    # Display label covers both states.
-                    expanded.update({"ARCHIVED", "RAW_REMOVED"})
-                    continue
-                expanded.add(token)
-            return expanded
-
-        include: Optional[set[str]] = None
-        exclude: set[str] = set()
-        if include_status:
-            include = _expand({s.strip().upper() for s in include_status.split(",") if s.strip()})
-        if exclude_status:
-            exclude = _expand({s.strip().upper() for s in exclude_status.split(",") if s.strip()})
-
-        def _expand_integ(tokens: set[str]) -> set[str]:
-            expanded: set[str] = set()
-            for token in tokens:
-                if token in {"-", "NONE", "NOT_CHECKED", "UNCHECKED"}:
-                    expanded.add("-")
-                else:
-                    expanded.add(token)
-            return expanded
-
-        integ_include: Optional[set[str]] = None
-        integ_exclude: set[str] = set()
-        if include_integ:
-            integ_include = _expand_integ({s.strip().upper() for s in include_integ.split(",") if s.strip()})
-        if exclude_integ:
-            integ_exclude = _expand_integ({s.strip().upper() for s in exclude_integ.split(",") if s.strip()})
-
-        filtered = []
-        for snap in snapshots:
-            status = str(getattr(snap, "status", "")).upper()
-            if include is not None and status not in include:
-                continue
-            if status in exclude:
-                continue
-            integ_label = _integ_label(str(getattr(snap, "key", "")))
-            if integ_include is not None and integ_label not in integ_include:
-                continue
-            if integ_label in integ_exclude:
-                continue
-            filtered.append(snap)
-        snapshots = filtered
-    width = _effective_print_width(root=args.root)
-    logger.info(
-        "%s",
-        render_scan_table(
-            snapshots,
-            max_width=width,
-            registry=registry,
-            show_issue_details=logger.isEnabledFor(logging.DEBUG),
-        ),
-    )
     return 0
 
 
@@ -778,83 +775,88 @@ def cmd_about(args: argparse.Namespace) -> int:
     return 0
 
 
+def _removed(name: str) -> Callable[[argparse.Namespace], int]:
+    def cmd(args: argparse.Namespace) -> int:
+        print(REMOVED_COMMANDS[name], file=sys.stderr)
+        return 2
+
+    return cmd
+
+
+_BACKUP_DESCRIPTION = """\
+Archive raw ParaVision study folders as zip files and keep them verified.
+
+main commands:
+  status    show the recorded state (--scan looks again, --issues shows problems only)
+  create    make archives for raw folders that have none (never touches an existing archive)
+  verify    check archives: --level list | crc (default) | content
+  repair    rebuild one archive from raw, keeping the old one in the trash
+  remove    move an archive into the trash
+  purge     permanently delete trash copies (asks for confirmation)
+  init      save the raw and archive folders in brkraw's config
+
+advanced: migrate (import a 0.3.x cache), about (versions and paths)
+
+brkraw-backup never deletes raw folders. Removed in 0.2.0: info, registry, scan, review, run.
+"""
+
+
 def register(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[name-defined]
     backup_parser = subparsers.add_parser(
         "backup",
-        help="Archive raw datasets into a zip-based backup registry.",
+        help="Archive raw datasets as zip files and keep them verified.",
+        description=_BACKUP_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = backup_parser.add_subparsers(dest="backup_command", metavar="command")
+
+    st = sub.add_parser("status", help="Show recorded state; --scan looks again, --issues shows problems only.")
+    st.add_argument("keys", nargs="*", metavar="KEY", help="Only these datasets.")
+    _add_path_args(st)
+    st.add_argument("--scan", action="store_true", help="Look at the raw and archive folders again and update the registry.")
+    st.add_argument("--issues", action="store_true", help="Show only datasets with a problem (and the problem).")
+    st.add_argument("--status", help="Filter by status (comma-separated), e.g. OK,ARCHIVED,TODO,UNFINISHED.")
+    st.set_defaults(func=cmd_status, parser=st)
+
+    cr = sub.add_parser("create", help="Create archives for raw folders without one (never changes an existing archive).")
+    cr.add_argument("keys", nargs="*", metavar="KEY", help="Only these raw folders (default: every raw folder without an archive).")
+    _add_path_args(cr)
+    cr.set_defaults(func=cmd_create, parser=cr)
+
+    ve = sub.add_parser("verify", help="Verify archives (list, crc or content).")
+    ve.add_argument("keys", nargs="*", metavar="KEY", help="Archives to verify.")
+    ve.add_argument("--all", action="store_true", help="Verify every archive in the archive folder.")
+    ve.add_argument("--level", choices=list(LEVELS), default="crc",
+                    help="list: names and sizes vs raw; crc: read every member (default, no raw needed); "
+                         "content: crc plus raw file CRC-32 comparison.")
+    ve.add_argument("--path", help="Which archive to use when a KEY has two (e.g. .zip and .PvDatasets).")
+    _add_path_args(ve)
+    ve.set_defaults(func=cmd_verify, parser=ve)
+
+    rp = sub.add_parser("repair", help="Rebuild archives from raw; the old archive is kept in the trash.")
+    rp.add_argument("keys", nargs="*", metavar="KEY", help="Archives to rebuild (at least one).")
+    rp.add_argument("--path", help="Which archive to use when a KEY has two.")
+    _add_path_args(rp)
+    rp.set_defaults(func=cmd_repair, parser=rp)
+
+    rm = sub.add_parser("remove", help="Move archives into the trash (nothing is deleted).")
+    rm.add_argument("keys", nargs="*", metavar="KEY", help="Archives to move (at least one).")
+    rm.add_argument("--path", help="Which archive to use when a KEY has two.")
+    _add_path_args(rm)
+    rm.set_defaults(func=cmd_remove, parser=rm)
+
+    pg = sub.add_parser("purge", help="Permanently delete trash copies of the named keys.")
+    pg.add_argument("keys", nargs="*", metavar="KEY", help="Keys whose trash copies to delete (at least one).")
+    pg.add_argument("--yes", action="store_true", help="Do not ask for confirmation.")
+    _add_path_args(pg)
+    pg.set_defaults(func=cmd_purge, parser=pg)
 
     init_p = sub.add_parser("init", help="Register raw/archive paths into brkraw config.yaml.")
     _add_init_args(init_p)
     init_p.set_defaults(func=cmd_init, parser=init_p)
 
-    info_p = sub.add_parser("info", help="Show last scanned status from the JSON registry.")
-    info_p.add_argument("archive_root", nargs="?", help="Directory that stores the JSON registry and archives.")
-    info_p.add_argument("--archive", dest="archive", help="Override config backup.archive for this command.")
-    info_p.add_argument(
-        "--registry",
-        default=DEFAULT_REGISTRY_NAME,
-        help=f"Registry filename stored under archive_root (default: {DEFAULT_REGISTRY_NAME}).",
-    )
-    info_p.add_argument(
-        "--status",
-        help="Filter by status (comma-separated), e.g. OK,ARCHIVED,MISMATCH.",
-    )
-    info_p.add_argument(
-        "--exclude-status",
-        dest="exclude_status",
-        help="Exclude statuses (comma-separated).",
-    )
-    info_p.add_argument(
-        "--integ",
-        help="Filter by integrity state (comma-separated): -,OK,WARN,FAIL,SKIP.",
-    )
-    info_p.add_argument(
-        "--exclude-integ",
-        dest="exclude_integ",
-        help="Exclude integrity states (comma-separated).",
-    )
-    info_p.add_argument(
-        "--root",
-        help="Override brkraw config root directory (default: BRKRAW_CONFIG_HOME or ~/.brkraw).",
-    )
-    info_p.set_defaults(func=cmd_registry, parser=info_p)
-
-    # Backwards-compatible alias.
-    reg_p = sub.add_parser("registry", help=argparse.SUPPRESS)
-    reg_p.add_argument("archive_root", nargs="?")
-    reg_p.add_argument("--archive", dest="archive")
-    reg_p.add_argument("--registry", default=DEFAULT_REGISTRY_NAME)
-    reg_p.add_argument("--root")
-    reg_p.set_defaults(func=cmd_registry, parser=reg_p)
-
-    about_p = sub.add_parser("about", help="Show plugin version and config paths.")
-    about_p.add_argument(
-        "--root",
-        help="Override brkraw config root directory (default: BRKRAW_CONFIG_HOME or ~/.brkraw).",
-    )
-    about_p.set_defaults(func=cmd_about, parser=about_p)
-
-    scan_p = sub.add_parser("scan", help="Scan raw/archive dirs and update registry.")
-    _add_common_args(scan_p)
-    scan_p.set_defaults(func=cmd_scan, parser=scan_p)
-
-    review_p = sub.add_parser("review", help="Show only datasets with issues.")
-    _add_common_args(review_p)
-    review_p.set_defaults(func=cmd_review, parser=review_p)
-
-    run_p = sub.add_parser("run", help="Create/update archives for missing/mismatched datasets.")
-    _add_common_args(run_p)
-    run_p.add_argument("--only", help="Comma-separated dataset names to process.")
-    run_p.add_argument("--rebuild", action="store_true", help="Rebuild archives from scratch when present.")
-    run_p.add_argument("--dry-run", action="store_true", help="Plan actions without writing.")
-    run_p.add_argument("--delete-raw", action="store_true", help="Delete raw dataset after successful archive.")
-    run_p.add_argument("--yes", action="store_true", help="Confirm destructive operations (e.g., --delete-raw).")
-    run_p.set_defaults(func=cmd_run, parser=run_p)
-
-    mig_p = sub.add_parser("migrate", help="Migrate legacy (.brk-backup_cache) into JSON registry.")
-    _add_common_args(mig_p)
+    mig_p = sub.add_parser("migrate", help="(advanced) Migrate a legacy .brk-backup_cache into the JSON registry.")
+    _add_migrate_args(mig_p)
     mig_p.add_argument(
         "--old-cache",
         default=".brk-backup_cache",
@@ -864,6 +866,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[na
     mig_p.add_argument("--keep-logs", type=int, default=50, help="Keep last N legacy log records (default: 50).")
     mig_p.add_argument("--no-scan", action="store_true", help="Skip a post-migration scan/update.")
     mig_p.set_defaults(func=cmd_migrate, parser=mig_p)
+
+    about_p = sub.add_parser("about", help="(advanced) Show plugin version and config paths.")
+    about_p.add_argument("--root", help=_ROOT_HELP)
+    about_p.set_defaults(func=cmd_about, parser=about_p)
+
+    for name in REMOVED_COMMANDS:
+        old = sub.add_parser(name, help=argparse.SUPPRESS, add_help=False, prefix_chars="\x00")
+        old.add_argument("ignored", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+        old.set_defaults(func=_removed(name), parser=old)
 
     backup_parser.set_defaults(
         func=lambda args: (args.parser.print_help() or 2),  # type: ignore[attr-defined]

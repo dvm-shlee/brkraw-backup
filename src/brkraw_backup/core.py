@@ -1,3 +1,8 @@
+"""Status scan, JSON registry, status table and legacy-cache migration.
+
+Nothing in this module writes to a raw folder or to an archive. The commands
+that change files are in actions.py; verification is in verify.py.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -8,11 +13,12 @@ import os
 from pathlib import Path
 import pickle
 import shutil
-import zipfile
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Callable, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Callable
 
 from brkraw.core.formatter import format_data
 from brkraw.dataclasses.study import Study
+
+from . import layout
 
 logger = logging.getLogger("brkraw")
 
@@ -69,72 +75,6 @@ def _zip_size_bytes(path: Path) -> int:
         return 0
 
 
-def _is_candidate_raw_dir(name: str) -> bool:
-    if not name or name.startswith("."):
-        return False
-    if "import" in name:
-        return False
-    return True
-
-
-def _iter_raw_datasets(raw_root: Path) -> Dict[str, Path]:
-    datasets: Dict[str, Path] = {}
-    if not raw_root.exists():
-        return datasets
-    for entry in sorted(raw_root.iterdir()):
-        if not entry.is_dir():
-            continue
-        if not _is_candidate_raw_dir(entry.name):
-            continue
-        datasets[entry.name] = entry
-    return datasets
-
-
-def _iter_archive_files(archive_root: Path) -> Dict[str, Path]:
-    datasets: Dict[str, Path] = {}
-    if not archive_root.exists():
-        return datasets
-    for entry in sorted(archive_root.iterdir()):
-        if not entry.is_file():
-            continue
-        name = entry.name
-        lower = name.lower()
-        if lower.endswith(".zip"):
-            key = name[:-4]
-        elif lower.endswith(".pvdatasets"):
-            key = name[: -len(".pvdatasets")]
-        elif name.endswith("PvDatasets"):
-            key = name[: -len("PvDatasets")]
-            if key.endswith("."):
-                key = key[:-1]
-        else:
-            continue
-
-        key = key.strip()
-        if not key:
-            continue
-        if key.startswith("."):
-            continue
-        # NOTE: Do not call zipfile.is_zipfile() here. It can be expensive on
-        # network-mounted archives. Validation happens later when we load metadata.
-        datasets[key] = entry
-    return datasets
-
-
-def _archive_key(zip_path: Path) -> str:
-    # Retained for compatibility; avoid opening archives here.
-    name = zip_path.name
-    lower = name.lower()
-    if lower.endswith(".zip"):
-        return name[:-4]
-    if lower.endswith(".pvdatasets"):
-        return name[: -len(".pvdatasets")]
-    if name.endswith("PvDatasets"):
-        key = name[: -len("PvDatasets")]
-        return key[:-1] if key.endswith(".") else key
-    return zip_path.stem
-
-
 def _load_loader(path: Path) -> Tuple[bool, Optional[int], Optional[str]]:
     try:
         study = Study.from_path(path)
@@ -155,12 +95,21 @@ def scan_datasets(
     *,
     reporter: Optional[ProgressReporter] = None,
 ) -> List[DatasetSnapshot]:
+    """Look at the raw and archive folders (names, sizes, a quick brkraw load).
+
+    This is not a verification: use verify.verify_archive for crc/content checks.
+    """
     logger.info("Scan start: raw_root=%s archive_root=%s", raw_root, archive_root)
-    raw_datasets = _iter_raw_datasets(raw_root)
-    archive_datasets = _iter_archive_files(archive_root)
+    raw_datasets = layout.raw_candidates(raw_root)
+    archive_all = layout.archive_candidates(archive_root)
+    # A key with two archives (e.g. <key>.zip and <key>.PvDatasets) is shown as
+    # duplicate_archive; the first one (sorted) is used only for the display columns.
+    archive_datasets = {k: v[0] for k, v in archive_all.items()}
+    journals = layout.list_journals(archive_root)
+    partials = layout.partial_files(archive_root)
     logger.info("Discovered candidates: raw=%d archive=%d", len(raw_datasets), len(archive_datasets))
 
-    keys = sorted(set(raw_datasets) | set(archive_datasets))
+    keys = sorted(set(raw_datasets) | set(archive_datasets) | set(journals))
     snapshots: List[DatasetSnapshot] = []
 
     total = len(keys)
@@ -192,8 +141,15 @@ def scan_datasets(
         # only when the archive is not readable/valid.
         if not raw_present and arc_present and not arc_valid:
             issues.append("raw_missing")
-        if not raw_present and not arc_present:
+        if not raw_present and not arc_present and key not in journals:
             issues.append("both_missing")
+        if len(archive_all.get(key, [])) > 1:
+            issues.append("duplicate_archive")
+        if key in journals:
+            j = journals[key]
+            issues.append("unfinished:%s:%s" % (j.get("op"), j.get("step")))
+        if key in partials:
+            issues.append("partial_file")
         if raw_present and arc_present and raw_valid and arc_valid:
             if raw_scans is not None and arc_scans is not None and raw_scans != arc_scans:
                 issues.append("scan_count_mismatch")
@@ -236,6 +192,10 @@ def _derive_status(
     archive_valid: bool,
     issues: Sequence[str],
 ) -> str:
+    if any(i.startswith("unfinished:") for i in issues):
+        return "UNFINISHED"
+    if "duplicate_archive" in issues:
+        return "DUPLICATE"
     if archive_present and not archive_valid:
         return "CORRUPT"
     if raw_present and not raw_valid:
@@ -266,7 +226,8 @@ def load_registry(path: Path) -> Dict[str, Any]:
     except Exception as exc:
         backup = path.with_suffix(path.suffix + ".bak")
         try:
-            shutil.copy2(path, backup)
+            with path.open("rb") as src, layout.create_new(backup, "wb") as dst:
+                shutil.copyfileobj(src, dst)
             logger.warning("Registry unreadable (%s); backed up to %s", path, backup)
         except Exception:
             logger.warning("Registry unreadable (%s): %s", path, exc)
@@ -279,7 +240,7 @@ def save_registry(path: Path, data: Mapping[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = dict(data)
     payload["updated_at"] = _utcnow()
-    with tmp.open("w", encoding="utf-8") as f:
+    with layout.create_new(tmp, "w") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
     tmp.replace(path)
@@ -313,43 +274,16 @@ def update_registry(
     return data
 
 
-def mark_backup_result(
-    registry: Dict[str, Any],
-    *,
-    key: str,
-    archive_path: Path,
-    added: int,
-    skipped: int,
-    verified: bool,
-    dry_run: bool,
-) -> None:
-    datasets = registry.setdefault("datasets", {})
+def set_entry_fields(registry: Dict[str, Any], key: str, fields: Mapping[str, Any]) -> None:
+    datasets = registry.get("datasets")
     if not isinstance(datasets, dict):
         datasets = {}
         registry["datasets"] = datasets
-    entry = datasets.get(key, {})
+    entry = datasets.get(key)
     if not isinstance(entry, dict):
-        entry = {}
-    entry.update(
-        {
-            "last_backup": _utcnow(),
-            "last_backup_archive_path": str(archive_path),
-            "last_backup_added": int(added),
-            "last_backup_skipped": int(skipped),
-            "last_backup_verified": bool(verified),
-            "last_backup_dry_run": bool(dry_run),
-        }
-    )
+        entry = {"key": key}
+    entry.update(dict(fields))
     datasets[key] = entry
-    logger.debug(
-        "Backup result: key=%s archive=%s added=%d skipped=%d verified=%s dry_run=%s",
-        key,
-        archive_path,
-        added,
-        skipped,
-        verified,
-        dry_run,
-    )
 
 
 def _status_cell(status: str) -> Mapping[str, Any]:
@@ -366,149 +300,13 @@ def _status_cell(status: str) -> Mapping[str, Any]:
         return {"value": label, "color": "green", "bold": True}
     if status == "MISSING":
         return {"value": label, "color": "blue", "bold": True}
-    if status in {"CORRUPT", "INVALID"}:
+    if status in {"CORRUPT", "INVALID", "DUPLICATE", "UNFINISHED"}:
         return {"value": label, "color": "red", "bold": True}
     if status == "MISMATCH":
         return {"value": label, "color": "yellow", "bold": True}
     if status == "RAW_REMOVED":
         return {"value": label, "color": "cyan"}
     return {"value": label, "color": "gray"}
-
-
-def _zip_root_prefix(zf: zipfile.ZipFile) -> str:
-    names = [n.strip("/") for n in zf.namelist() if n.strip("/")]
-    if not names:
-        return ""
-    first = names[0].split("/")[0]
-    for n in names[1:]:
-        if not n.startswith(first + "/") and n != first:
-            return ""
-    return first
-
-
-def _zip_file_set(path: Path) -> Set[str]:
-    with zipfile.ZipFile(path, "r") as zf:
-        prefix = _zip_root_prefix(zf)
-        files: Set[str] = set()
-        for info in zf.infolist():
-            name = info.filename
-            if not name or name.endswith("/"):
-                continue
-            name = name.strip("/")
-            if prefix and name.startswith(prefix + "/"):
-                name = name[len(prefix) + 1 :]
-            if name:
-                files.add(name)
-        return files
-
-
-def _dir_file_set(path: Path) -> Set[str]:
-    files: Set[str] = set()
-    for dirpath, _, filenames in os.walk(path):
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            try:
-                rel = full.relative_to(path).as_posix()
-            except Exception:
-                continue
-            if rel:
-                files.add(rel)
-    return files
-
-
-def _zip_file_sizes(path: Path) -> tuple[Set[str], int]:
-    """Return (file set, sum of uncompressed file sizes) for a zip archive."""
-    with zipfile.ZipFile(path, "r") as zf:
-        prefix = _zip_root_prefix(zf)
-        files: Set[str] = set()
-        total = 0
-        for info in zf.infolist():
-            name = info.filename
-            if not name or name.endswith("/"):
-                continue
-            name = name.strip("/")
-            if prefix and name.startswith(prefix + "/"):
-                name = name[len(prefix) + 1 :]
-            if not name:
-                continue
-            files.add(name)
-            try:
-                total += int(getattr(info, "file_size", 0) or 0)
-            except Exception:
-                pass
-        return files, total
-
-
-def _dir_file_sizes(path: Path) -> tuple[Set[str], int]:
-    """Return (file set, sum of file sizes) for a directory tree."""
-    files: Set[str] = set()
-    total = 0
-    for dirpath, _, filenames in os.walk(path):
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            try:
-                rel = full.relative_to(path).as_posix()
-            except Exception:
-                continue
-            if not rel:
-                continue
-            files.add(rel)
-            try:
-                total += full.stat().st_size
-            except OSError:
-                continue
-    return files, total
-
-
-def deep_integrity_check(raw_path: Path, archive_path: Path) -> Dict[str, Any]:
-    """Optional heavy check: compare raw vs archive file lists (zip-only)."""
-    raw_path = raw_path.resolve(strict=False)
-    archive_path = archive_path.resolve(strict=False)
-    started = _dt.datetime.now(tz=_dt.timezone.utc)
-
-    result: Dict[str, Any] = {
-        "checked_at": started.isoformat(),
-        "method": "filelist",
-        "raw_path": str(raw_path),
-        "archive_path": str(archive_path),
-    }
-
-    if not raw_path.exists() or not raw_path.is_dir():
-        result.update({"ok": False, "error": "raw_not_found"})
-        return result
-    if not archive_path.exists() or not archive_path.is_file():
-        result.update({"ok": False, "error": "archive_not_found"})
-        return result
-    if not zipfile.is_zipfile(archive_path):
-        result.update({"ok": None, "error": "archive_not_zip"})
-        return result
-
-    try:
-        raw_files, raw_bytes = _dir_file_sizes(raw_path)
-        arc_files, arc_uncompressed_bytes = _zip_file_sizes(archive_path)
-    except Exception as exc:
-        result.update({"ok": False, "error": f"exception:{type(exc).__name__}"})
-        return result
-
-    missing = sorted(raw_files - arc_files)
-    extra = sorted(arc_files - raw_files)
-    bytes_match = raw_bytes == arc_uncompressed_bytes
-    result.update(
-        {
-            "ok": len(missing) == 0,
-            "raw_files": len(raw_files),
-            "archive_files": len(arc_files),
-            "raw_bytes": raw_bytes,
-            "archive_uncompressed_bytes": arc_uncompressed_bytes,
-            "bytes_match": bytes_match,
-            "bytes_delta": arc_uncompressed_bytes - raw_bytes,
-            "missing_files": len(missing),
-            "extra_files": len(extra),
-            "missing_examples": missing[:20],
-            "extra_examples": extra[:20],
-        }
-    )
-    return result
 
 
 def _format_bytes(value: Optional[int]) -> str:
@@ -541,6 +339,16 @@ def _format_backup_time(value: Optional[str]) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def verify_label(entry: Any) -> str:
+    """'crc:OK', 'content:FAIL', or '-' from a registry entry's last verify record."""
+    if not isinstance(entry, Mapping):
+        return "-"
+    v = entry.get("verify")
+    if not isinstance(v, Mapping) or not v.get("level"):
+        return "-"
+    return "%s:%s" % (v.get("level"), "OK" if v.get("ok") else "FAIL")
+
+
 def _truncate(text: str, max_len: int) -> str:
     if max_len <= 0:
         return ""
@@ -568,32 +376,17 @@ def render_scan_table(
     # Hard cap to keep very long dataset names from blowing up table alignment.
     # (Python format alignment does not truncate, so we must truncate ourselves.)
     KEY_CAP = 45
-    key_w = min(max_key_len, KEY_CAP)
+    key_w = min(max(max_key_len, len("DATASET")), KEY_CAP)
 
-    def _last_backup(key: str) -> str:
+    def _entry(key: str) -> Mapping[str, Any]:
         entry = reg_datasets.get(key)
-        if isinstance(entry, Mapping):
-            return _format_backup_time(entry.get("last_backup"))  # type: ignore[arg-type]
+        return entry if isinstance(entry, Mapping) else {}
+
+    def _verify_at(key: str) -> str:
+        v = _entry(key).get("verify")
+        if isinstance(v, Mapping):
+            return _format_backup_time(v.get("checked_at"))  # type: ignore[arg-type]
         return "-"
-
-    def _integrity_status(key: str) -> str:
-        entry = reg_datasets.get(key)
-        if not isinstance(entry, Mapping):
-            return "-"
-        integ = entry.get("integrity")
-        if not isinstance(integ, Mapping):
-            return "-"
-        ok = integ.get("ok")
-        bytes_match = integ.get("bytes_match")
-        if ok is True:
-            if bytes_match is False:
-                return "WARN"
-            return "OK"
-        if ok is False:
-            return "FAIL"
-        if ok is None:
-            return "SKIP"
-        return "?"
 
     for snap in snapshots:
         raw_scans = "-" if not snap.raw_present else (snap.raw_scan_count if snap.raw_scan_count is not None else "?")
@@ -601,20 +394,17 @@ def render_scan_table(
             snap.archive_scan_count if snap.archive_scan_count is not None else "?"
         )
         issues = ",".join(snap.issues) if snap.issues else ""
-        raw_sz = _format_bytes(snap.raw_bytes) if snap.raw_present else "-"
-        arc_sz = _format_bytes(snap.archive_bytes) if snap.archive_present else "-"
-        bkp_at = _last_backup(snap.key)
-        integ = _integrity_status(snap.key)
         rows.append(
             {
                 "key": snap.key,
                 "rawn": raw_scans,
                 "arcn": arc_scans,
-                "rawsz": raw_sz,
-                "arcsz": arc_sz,
-                "bkp": bkp_at,
+                "rawsz": _format_bytes(snap.raw_bytes) if snap.raw_present else "-",
+                "arcsz": _format_bytes(snap.archive_bytes) if snap.archive_present else "-",
+                "bkp": _format_backup_time(_entry(snap.key).get("last_backup")),  # type: ignore[arg-type]
                 "status": snap.status,
-                "integ": integ,
+                "verify": verify_label(_entry(snap.key)),
+                "vat": _verify_at(snap.key),
                 "issues": issues,
             }
         )
@@ -624,62 +414,35 @@ def render_scan_table(
             return str(value.get("value", ""))
         return str(value)
 
-    # compute widths from actual rendered values
+    def _w(title: str, col: str) -> int:
+        return max(len(title), max((len(_cell_text(r[col])) for r in rows), default=1))
+
     gap = "  "
-    raw_w = max(len("RAW"), max((len(_cell_text(r["rawn"])) for r in rows), default=1))
-    arc_w = max(len("ARC"), max((len(_cell_text(r["arcn"])) for r in rows), default=1))
-    rawsz_w = max(len("RAW_SZ"), max((len(_cell_text(r["rawsz"])) for r in rows), default=1))
-    arcz_w = max(len("ARC_SZ"), max((len(_cell_text(r["arcsz"])) for r in rows), default=1))
-    bkp_w = max(len("BACKUP_AT"), max((len(_cell_text(r["bkp"])) for r in rows), default=1))
-    status_w = max(len("STATUS"), max((len(_cell_text(r["status"])) for r in rows), default=1))
-    integ_w = max(len("INTEG"), max((len(_cell_text(r["integ"])) for r in rows), default=1))
+    raw_w = _w("RAW", "rawn")
+    arc_w = _w("ARC", "arcn")
+    rawsz_w = _w("RAW_SZ", "rawsz")
+    arcz_w = _w("ARC_SZ", "arcsz")
+    bkp_w = _w("BACKUP_AT", "bkp")
+    status_w = _w("STATUS", "status")
+    ver_w = _w("VERIFY", "verify")
+    vat_w = _w("VERIFY_AT", "vat")
 
-    fixed = (
-        len(gap)
-        + raw_w
-        + len(gap)
-        + arc_w
-        + len(gap)
-        + rawsz_w
-        + len(gap)
-        + arcz_w
-        + len(gap)
-        + bkp_w
-        + len(gap)
-        + status_w
-        + len(gap)
-        + integ_w
-        + len(gap)
-    )
+    fixed = len(gap) * 8 + raw_w + arc_w + rawsz_w + arcz_w + bkp_w + status_w + ver_w + vat_w
 
-    issues_w: Optional[int] = None
     if max_width is not None:
-        # Ensure at least some room for key.
         min_key = 20
-        # Prefer user's "max+3" key width, but clamp to max_width.
         max_key_allowed = max(min_key, max_width - fixed)
         key_w = min(key_w, max_key_allowed)
-        remaining = max_width - fixed - key_w
-        issues_w = max(0, remaining)
-
-        # issues truncation for width control happens below (common path)
 
     # Always truncate/pad keys and status using formatter-aware padding.
     # (ANSI styling breaks Python's built-in width calculations.)
+    # Issues are not a column; they go on their own line below the row.
     for row in rows:
         key_text = _truncate(str(row.get("key", "")), key_w)
-        row["key"] = {
-            "value": key_text,
-            "bold": True,
-            "size": key_w,
-            "align": "left",
-        }
-        status_cell = _status_cell(str(row.get("status", "UNKNOWN")))
-        status_cell = dict(status_cell)
+        row["key"] = {"value": key_text, "bold": True, "size": key_w, "align": "left"}
+        status_cell = dict(_status_cell(str(row.get("status", "UNKNOWN"))))
         status_cell.update({"size": status_w, "align": "left"})
         row["status"] = status_cell
-        if issues_w is not None:
-            row["issues"] = _truncate(str(row.get("issues", "")), issues_w)
 
     template = (
         f"{{key}}{gap}"
@@ -689,7 +452,8 @@ def render_scan_table(
         f"{{arcsz: >{arcz_w}}}{gap}"
         f"{{bkp: <{bkp_w}}}{gap}"
         f"{{status}}{gap}"
-        f"{{integ: <{integ_w}}}"
+        f"{{verify: <{ver_w}}}{gap}"
+        f"{{vat: <{vat_w}}}"
     )
     header = (
         f"{'DATASET': <{key_w}}{gap}"
@@ -699,7 +463,8 @@ def render_scan_table(
         f"{'ARC_SZ': >{arcz_w}}{gap}"
         f"{'BACKUP_AT': <{bkp_w}}{gap}"
         f"{'STATUS': <{status_w}}{gap}"
-        f"{'INTEG': <{integ_w}}"
+        f"{'VERIFY': <{ver_w}}{gap}"
+        f"{'VERIFY_AT': <{vat_w}}"
     )
     sep = "-" * len(header)
     body_lines: List[str] = []
@@ -728,129 +493,6 @@ def render_scan_table(
 
     body = "\n".join(body_lines)
     return "\n".join([header, sep, body]) if body else "\n".join([header, sep])
-
-
-def archive_one(
-    raw_path: Path,
-    archive_root: Path,
-    *,
-    rebuild: bool,
-    dry_run: bool,
-    reporter: Optional[ProgressReporter] = None,
-) -> Tuple[Path, int, int]:
-    key = raw_path.name
-    dest = archive_root / f"{key}.zip"
-    logger.debug("Archiving dataset: %s -> %s (rebuild=%s dry_run=%s)", raw_path, dest, rebuild, dry_run)
-    if rebuild or not dest.exists():
-        added = _write_zip_from_dir(raw_path, dest, root_name=key, dry_run=dry_run, reporter=reporter)
-        return dest, added, 0
-
-    root_name = _archive_key(dest) or key
-    added, skipped = _append_missing_files(raw_path, dest, root_name=root_name, dry_run=dry_run, reporter=reporter)
-    return dest, added, skipped
-
-
-def _walk_files(root: Path) -> Iterable[Tuple[Path, str]]:
-    for dirpath, _, filenames in os.walk(root):
-        for name in filenames:
-            full = Path(dirpath) / name
-            rel = full.relative_to(root).as_posix()
-            yield full, rel
-
-
-def _write_zip_from_dir(
-    root: Path,
-    dest: Path,
-    *,
-    root_name: str,
-    dry_run: bool,
-    reporter: Optional[ProgressReporter] = None,
-) -> int:
-    files = list(_walk_files(root))
-    total = len(files)
-    if dry_run:
-        if reporter:
-            reporter(total, total, "zip:plan")
-        return len(files)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for idx, (full, rel) in enumerate(files, start=1):
-            if reporter:
-                reporter(idx, total, "zip:write")
-            arcname = f"{root_name}/{rel}".strip("/")
-            zf.write(full, arcname)
-    if reporter:
-        reporter(total, total, "zip:done")
-    return len(files)
-
-
-def _append_missing_files(
-    root: Path,
-    dest: Path,
-    *,
-    root_name: str,
-    dry_run: bool,
-    reporter: Optional[ProgressReporter] = None,
-) -> Tuple[int, int]:
-    if not dest.exists():
-        raise FileNotFoundError(dest)
-    existing: set[str] = set()
-    with zipfile.ZipFile(dest, "r") as zf:
-        for info in zf.infolist():
-            name = info.filename.rstrip("/")
-            if name:
-                existing.add(name)
-
-    add: List[Tuple[Path, str]] = []
-    skipped = 0
-    files = list(_walk_files(root))
-    total = len(files)
-    for idx, (full, rel) in enumerate(files, start=1):
-        if reporter:
-            reporter(idx, total, "zip:diff")
-        arcname = f"{root_name}/{rel}".strip("/")
-        if arcname in existing:
-            skipped += 1
-            continue
-        add.append((full, arcname))
-
-    if dry_run:
-        if reporter:
-            reporter(total, total, "zip:plan")
-        return len(add), skipped
-
-    with zipfile.ZipFile(dest, "a", compression=zipfile.ZIP_DEFLATED) as zf:
-        total_add = len(add)
-        for idx, (full, arcname) in enumerate(add, start=1):
-            if reporter:
-                reporter(idx, total_add, "zip:append")
-            zf.write(full, arcname)
-    if reporter:
-        reporter(total, total, "zip:done")
-    return len(add), skipped
-
-
-def maybe_delete_raw(
-    raw_path: Path,
-    *,
-    allow: bool,
-    confirmed: bool,
-    dry_run: bool,
-) -> None:
-    if not allow:
-        return
-    if not confirmed:
-        raise ValueError("Refusing to delete raw data without --yes.")
-    if dry_run:
-        logger.debug("Dry-run delete raw dataset: %s", raw_path)
-        return
-    logger.warning("Deleting raw dataset: %s", raw_path)
-    shutil.rmtree(raw_path)
-
-
-def verify_archive(zip_path: Path) -> bool:
-    ok, _, _ = _load_loader(zip_path)
-    return ok
 
 
 def snapshots_from_registry(registry: Mapping[str, Any]) -> List[DatasetSnapshot]:

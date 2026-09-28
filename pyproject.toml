@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brkraw-backup"
-version = "0.1.4"
+version = "0.2.0"
 description = "Backup/archive CLI plugin for brkraw."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -23,3 +23,8 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Test the working tree (src/), not an installed copy; tests/ holds the data helpers.
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
