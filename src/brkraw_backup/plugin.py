@@ -33,15 +33,6 @@ _BANNER_PRINTED = False
 _STDOUT: TextIO = cast(TextIO, sys.__stdout__)
 _STDERR: TextIO = cast(TextIO, sys.__stderr__)
 
-# Commands removed in 0.2.0 (BRK-0052): no alias, one line, exit 2.
-REMOVED_COMMANDS: Dict[str, str] = {
-    "info": "`info` was removed in brkraw-backup 0.2.0; use `brkraw backup status`.",
-    "registry": "`registry` was removed in brkraw-backup 0.2.0; use `brkraw backup status`.",
-    "scan": "`scan` was removed in brkraw-backup 0.2.0; use `brkraw backup status --scan`.",
-    "review": "`review` was removed in brkraw-backup 0.2.0; use `brkraw backup status --scan --issues`.",
-    "run": "`run` was removed in brkraw-backup 0.2.0; use `brkraw backup create` (to rebuild an archive: `brkraw backup repair KEY`).",
-}
-
 
 def _banner() -> None:
     global _BANNER_PRINTED
@@ -775,14 +766,6 @@ def cmd_about(args: argparse.Namespace) -> int:
     return 0
 
 
-def _removed(name: str) -> Callable[[argparse.Namespace], int]:
-    def cmd(args: argparse.Namespace) -> int:
-        print(REMOVED_COMMANDS[name], file=sys.stderr)
-        return 2
-
-    return cmd
-
-
 _BACKUP_DESCRIPTION = """\
 Archive raw ParaVision study folders as zip files and keep them verified.
 
@@ -870,14 +853,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[na
     about_p = sub.add_parser("about", help="(advanced) Show plugin version and config paths.")
     about_p.add_argument("--root", help=_ROOT_HELP)
     about_p.set_defaults(func=cmd_about, parser=about_p)
-
-    # No `help=` here on purpose: argparse lists a sub-command in --help whenever `help` is
-    # given at all (even SUPPRESS, which prints "name ==SUPPRESS=="). Without it the parser
-    # still answers to the old name but is not listed.
-    for name in REMOVED_COMMANDS:
-        old = sub.add_parser(name, add_help=False, prefix_chars="\x00")
-        old.add_argument("ignored", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        old.set_defaults(func=_removed(name), parser=old)
 
     backup_parser.set_defaults(
         func=lambda args: (args.parser.print_help() or 2),  # type: ignore[attr-defined]

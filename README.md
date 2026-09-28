@@ -153,7 +153,7 @@ deletion fails it stops and tells you what was already deleted.
 ### Exit codes
 
 `0` done, `1` a check or step failed (the message says what; unfinished work keeps
-its journal), `2` nothing was done (bad name, missing raw for `repair`, removed
+its journal), `2` nothing was done (bad name, missing raw for `repair`, unknown
 command, refused confirmation).
 
 ## Changes in 0.2.0
@@ -170,8 +170,8 @@ The command set was replaced without aliases:
 | `run --rebuild` | `repair KEY` |
 | `--integrity` | `verify --level list` / `content` |
 
-A removed command prints one line naming its replacement and exits with code 2
-without doing anything. `status`, `create`, `verify`, `repair`, `remove` and
+The old names no longer exist anywhere in the code: typing one gives argparse's
+ordinary "invalid choice" error, exit code 2, and nothing is changed. `status`, `create`, `verify`, `repair`, `remove` and
 `purge` take the folders from the config or from `--rawdata`/`--archive` (not as
 positional arguments). The registry keeps entries written by 0.1.x.
 

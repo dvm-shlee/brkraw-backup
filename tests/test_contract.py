@@ -421,19 +421,37 @@ def test_t5_two_archives_for_one_key(env, caplog):
 
 # --- T6 removed commands -------------------------------------------------------------
 
-@pytest.mark.parametrize("old,new", [
-    ("info", "status"), ("registry", "status"), ("scan", "status --scan"),
-    ("review", "status --scan --issues"), ("run", "create"),
-])
-def test_t6_removed_commands(env, capsys, old, new):
+OLD_NAMES = ("info", "registry", "scan", "review", "run")
+
+
+@pytest.mark.parametrize("old", OLD_NAMES)
+def test_t6_removed_commands_are_plain_argparse_errors(env, capsys, old):
     make(env)
     before = state(env.tmp)
     argv = ["backup", old, str(env.raw), str(env.arc), "--delete-raw", "--yes", "--rebuild"]
-    assert main(argv) == 2
-    err = capsys.readouterr().err.strip().splitlines()
-    assert len(err) == 1 and "0.2.0" in err[0] and ("`brkraw backup %s`" % new) in err[0]
-    assert main(["backup", old]) == 2
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice: '%s'" % old in err
+    assert "removed" not in err and "use `brkraw" not in err       # no guidance line (BRK-0054)
+    with pytest.raises(SystemExit) as exc:
+        main(["backup", old])
+    assert exc.value.code == 2
     assert state(env.tmp) == before
+
+
+def test_t6_choose_from_list_has_no_old_names(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["backup", "bogus"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice: 'bogus'" in err
+    listed = err.split("choose from", 1)[1]
+    for name in ("status", "create", "verify", "repair", "remove", "purge", "init", "migrate", "about"):
+        assert name in listed
+    for old in OLD_NAMES:
+        assert ("'%s'" % old) not in listed, old
 
 
 def test_t6_delete_raw_option_is_gone(env):
@@ -713,13 +731,14 @@ def test_readme_matches_the_command_set():
     sub = next(a for a in backup._actions if a.__class__.__name__ == "_SubParsersAction")
     registered = set(sub.choices)
     main_cmds = {"status", "create", "verify", "repair", "remove", "purge", "init", "migrate", "about"}
-    assert registered == main_cmds | set(plugin.REMOVED_COMMANDS)
+    assert registered == main_cmds
+    assert not hasattr(plugin, "REMOVED_COMMANDS")
     readme = (SRC.parents[1] / "README.md").read_text(encoding="utf-8")
     table = readme.split("## Commands", 1)[1].split("###", 1)[0]
     for name in main_cmds:
         assert ("`%s" % name) in table, name
     changes = readme.split("## Changes in 0.2.0", 1)[1]
-    for name in plugin.REMOVED_COMMANDS:
+    for name in OLD_NAMES:
         assert ("`%s`" % name) in changes, name
     assert "never deletes a raw folder" in readme
 
@@ -739,12 +758,14 @@ def test_help_does_not_show_removed_names_or_suppress(capsys):
         main(["backup", "--help"])
     out = capsys.readouterr().out
     assert "SUPPRESS" not in out
-    for old in plugin.REMOVED_COMMANDS:
+    for old in OLD_NAMES:
         # not listed as a command (the word "registry" is fine inside a sentence)
         assert not re.search(r"^\s+%s(\s|$)" % old, out, re.M), old
         assert not re.search(r"[{,]%s[},]" % old, out), old
     assert "Removed in" not in out
     usage = out.split("\n\n", 1)[0]
     assert "{" not in usage
-    # the old names still answer (T6 covers the message and exit code)
-    assert main(["backup", "run"]) == 2
+    # an old name is an unknown command (T6 covers the error and exit code)
+    with pytest.raises(SystemExit) as exc:
+        main(["backup", "run"])
+    assert exc.value.code == 2
